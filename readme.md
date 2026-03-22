@@ -30,8 +30,12 @@ OpenClaw Gateway (systemd)
 自訂 Provider (claude-proxy)
     ↓
 Node.js Proxy (PM2, localhost:3456)
+    ↓  ┌─────────────────────────┐
+    ↓  │ Session Map             │
+    ↓  │ fingerprint → sessionId │
+    ↓  └─────────────────────────┘
     ↓
-claude --print (官方 CLI Binary)
+claude --print --permission-mode auto --resume <session-id>
     ↓
 Anthropic API (Max 訂閱)
 ```
@@ -40,12 +44,22 @@ Anthropic API (Max 訂閱)
 
 ---
 
+## 功能特色
+
+- **OpenAI 相容 API**：`POST /v1/chat/completions`，可直接作為 OpenClaw 的自訂 provider
+- **Session 持久化**：同一對話自動 `--resume`，Claude 記得完整歷史
+- **三階段動態工具核准**：Claude 需要工具時主動詢問，用戶核准後才授權，已核准的工具累積保留
+- **`--permission-mode auto`**：取代 `--dangerously-skip-permissions`，Claude 自行判斷安全操作
+- **Simulated streaming**：相容 OpenClaw 的 streaming 請求
+- **Session TTL**：閒置超過 24 小時自動清除
+
+---
+
 ## 完整步驟
 
-### Step 1：開 AWS EC2
+### Step 1：開 VPS / EC2
 
-- Region: ap-northeast-1 (Tokyo)
-- Instance: t3.small (2 vCPU, 2GB RAM)
+- Instance: t3.small (2 vCPU, 2GB RAM) 或同等 VPS
 - OS: Ubuntu 24.04 LTS
 - Storage: 30GB gp3
 - Security Group: **只開 SSH (22)，其他什麼都不開**
@@ -72,65 +86,37 @@ claude
 
 ### Step 3：部署 Proxy
 
-Proxy 的本質很簡單：接收 OpenAI 格式的 API 請求，轉成 CLI 指令丟給 Claude，再把回覆包成 OpenAI 格式回傳。
-
-**server.js 核心邏輯：**
-
-```javascript
-// 把 OpenAI messages 格式轉成純文字
-function messagesToPrompt(messages) {
-  const parts = [];
-  for (const msg of messages) {
-    const content = typeof msg.content === 'string' ? msg.content : '';
-    if (msg.role === 'system') {
-      parts.push(`[System Instructions]\n${content}\n[End System Instructions]`);
-    } else if (msg.role === 'assistant') {
-      parts.push(`[Previous Assistant Response]\n${content}`);
-    } else {
-      parts.push(content);
-    }
-  }
-  return parts.join('\n\n');
-}
-
-// 呼叫 Claude CLI
-function callClaude(prompt, systemPrompt) {
-  return new Promise((resolve, reject) => {
-    const args = ['--print'];
-    if (systemPrompt) args.push('--system-prompt', systemPrompt);
-    args.push(prompt);
-
-    const proc = spawn('claude', args, {
-      cwd: process.env.HOME || '/home/ubuntu',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-
-    let stdout = '';
-    proc.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
-    proc.on('close', (code) => {
-      code !== 0 ? reject(new Error('CLI failed')) : resolve(stdout.trim());
-    });
-  });
-}
-```
-
-**關鍵設計決策：**
-
-OpenClaw 會發 streaming 請求，但 `claude --print` 是一次輸出完整回覆。所以我用 **simulated stream** ── CLI 跑完後，把完整回覆包成一個 SSE chunk 回傳。比真 streaming 慢一點點（等 CLI 跑完才回），但 100% 穩定。
-
 ```bash
-mkdir ~/openclaw-claude-proxy
-# 把 server.js, package.json, .env 放進去
-cd ~/openclaw-claude-proxy
+git clone https://github.com/lydian/openclaw-claude-proxy.git
+cd openclaw-claude-proxy
 npm install
 
-# 生成 API Key
-echo "API_KEY=sk-proxy-$(openssl rand -hex 16)" >> .env
+# 設定環境變數
+cat > .env <<EOF
+API_KEY=$(openssl rand -hex 16)
+PORT=3456
+BIND_ADDR=127.0.0.1
+MAX_CONCURRENT=3
+REQUEST_TIMEOUT=300000
+SESSION_TTL=86400000
+EOF
 
 # 用 PM2 啟動 + 開機自啟
 pm2 start ecosystem.config.js
 pm2 save && pm2 startup
 ```
+
+**環境變數說明：**
+
+| 變數 | 預設值 | 說明 |
+|---|---|---|
+| `API_KEY` | （空，不驗證） | Proxy 的 Bearer Token |
+| `PORT` | `3456` | 監聽埠號 |
+| `BIND_ADDR` | `127.0.0.1` | 綁定地址（安全起見不要用 `0.0.0.0`） |
+| `MAX_CONCURRENT` | `3` | 最大同時請求數 |
+| `REQUEST_TIMEOUT` | `300000` | 請求逾時（毫秒） |
+| `SESSION_TTL` | `86400000` | Session 過期時間（預設 24 小時） |
+| `MAX_TOOL_TURNS` | `10` | Claude 工具執行最大回合數 |
 
 ### Step 4：安裝 OpenClaw
 
@@ -169,10 +155,14 @@ openclaw config set 'models.providers.claude-proxy' --json '{
   ]
 }'
 
+# 作為主要模型
 openclaw config set agents.defaults.model.primary "claude-proxy/claude-opus-4-6"
+
+# 或作為 fallback
+openclaw config set agents.defaults.model.fallbacks --json '["claude-proxy/claude-opus-4-6", "openrouter/auto"]'
 ```
 
-這樣 OpenClaw 就會把所有 AI 請求打到你的本地 Proxy，而不是直接打 OpenAI 或 Anthropic 的 API。
+這樣 OpenClaw 就會把所有 AI 請求打到你的本地 Proxy，而不是直接打 OpenAI 或 Anthropic 的 API。如果 OpenClaw 跑在 Docker 容器中，`baseUrl` 需改為 Docker bridge gateway IP（如 `http://172.21.0.1:3456/v1`），並確保防火牆允許容器存取該埠。
 
 ### Step 7：啟動
 
@@ -186,73 +176,91 @@ sudo systemctl start openclaw
 
 ---
 
+## API 端點
+
+| 方法 | 路徑 | 說明 |
+|---|---|---|
+| POST | `/v1/chat/completions` | OpenAI 相容的 chat completion（含三階段工具核准） |
+| GET | `/v1/models` | 可用模型列表 |
+| GET | `/health` | 健康檢查（含活躍 session 數） |
+| GET | `/sessions` | 列出所有 session 狀態、已核准工具（需認證） |
+
+回應中會包含 `claude_session_id` 欄位，方便追蹤。
+
+---
+
+## Session 機制
+
+Proxy 用 `hash(system_prompt + 第一條 user message)` 產生 fingerprint，對應到一個 Claude session：
+
+- **新對話**：`claude -p --permission-mode auto --session-id <UUID>`
+- **延續對話**：`claude -p --permission-mode auto --resume <UUID>`
+
+Resume 時只傳最後一條 user message，避免重複上下文。
+
+### 三階段工具核准
+
+```
+NORMAL ──(Claude 需要工具)──→ PENDING_APPROVAL
+                                    │
+                              (用戶回應)
+                                    │
+                    ┌───────────────┴───────────────┐
+                    ↓                               ↓
+            (核准工具)                        (拒絕/無關)
+                    │                               │
+          Advisor 解析工具                    直接當一般訊息
+          Resume + --allowedTools                   │
+                    │                               │
+                    └───────────→ NORMAL ←──────────┘
+```
+
+**流程範例：**
+
+```
+請求 1：「幫我看 /etc/hostname 的內容」
+  → Claude：{"response": "我需要 Read 權限...", "tools_need_approval": ["Read"]}
+  → 用戶收到：「我需要 Read 權限...」
+
+請求 2：「好，去做」
+  → Advisor 確認核准 ["Read"]
+  → claude -p --resume <UUID> --allowedTools "Read"
+  → Claude 讀取檔案，回傳結果（approvedTools 累積保留）
+
+請求 3：「幫我改 /etc/hosts」
+  → Claude 還需要 Write → 再走一次核准流程
+  → 核准後：--allowedTools "Read,Write"（累積）
+```
+
+Session 閒置超過 TTL 後自動清除，工具權限歸零。Resume 失敗時自動清除 session，下次請求重新建立。
+
+---
+
+## 安全性
+
+- **`--permission-mode auto`**：Claude 自行判斷操作安全性，高風險操作需用戶核准
+- **動態工具核准**：工具權限逐步授權，非一次全開
+- **`BIND_ADDR`**：預設 `127.0.0.1`，只接受本地連線。Docker 環境改為 bridge gateway IP，不要用 `0.0.0.0`
+- **建議跑在獨立 VPS/EC2 上**，不要跑在有個人資料的電腦上
+- **Claude Max 使用**：`claude --print` 是官方 CLI 功能，Request 從官方 Binary 出去。避免跑固定間隔的 heartbeat 任務，太規律的 pattern 可能被標記
+
+---
+
 ## 踩過的坑
 
 | 坑 | 症狀 | 解法 |
 |---|---|---|
 | Node 版本太低 | OpenClaw 啟動報錯 | Node 20 → 22 |
 | Gateway 不啟動 | `gateway.mode` 未設定 | `openclaw config set gateway.mode local` |
-| Telegram 拒絕回應 | `access not configured` | 設 `dmPolicy: allowlist` + 加你的 user ID |
-| Model 不認識 | `Unknown model: openai/claude-opus-4-6` | 不能用內建 provider，要用 `models.providers` 自訂 |
-| `OPENAI_BASE_URL` 沒用 | 請求打去真 OpenAI | OpenClaw 不讀這個環境變數，必須用 config |
-| Streaming 卡住 | Bot 沒回應也沒報錯 | `--print` 不支援真 streaming，改 simulated stream |
-| Sandbox 擋寫入 | Bot 說不能寫 workspace | 改 CLI 工作目錄到 `$HOME` + 開 `tools.fs.workspaceOnly: false` |
-
----
-
-## 跟原文作者方案的差異
-
-原文作者花了三個小時破三道牆：權限（跳過 Y 確認）、環境（TTY 模擬）、瀏覽器（封裝 Playwright 指令）。
-
-我的方案更簡單：
-
-| | 原文方案 | 我的方案 |
-|---|---|---|
-| CLI 模式 | 完整 Agent（需要 TTY 模擬） | `--print` 純文字模式 |
-| 權限處理 | `--dangerously-skip-permissions` | 不需要（print 模式無互動） |
-| 瀏覽器 | CLI 封裝 Playwright | OpenClaw 原生 Playwright |
-| 寫 code | CLI 原生工具 | OpenClaw coding-agent skill |
-| 架構 | CLI = 完整 Agent 替代品 | CLI = 純大腦，OpenClaw = 身體 |
-| 耗時 | 3 小時 | 1 小時 |
-
-核心差異：**我不讓 CLI 做 Agent 的事。CLI 只負責思考，OpenClaw 負責所有動作。** 兩邊各做各的強項，零坑。
-
----
-
-## 安全性
-
-跑在 AWS EC2 上而不是本地電腦，是刻意的選擇。
-
-OpenClaw 的 Agent 有能力讀寫檔案、操作瀏覽器、跑 shell 指令。跑在你的 Mac/PC 上，你的照片、密碼、私鑰全暴露在它面前。
-
-EC2 是一台空機器。OpenClaw 權力再大，面對一台沒有個人資料的 Ubuntu，也搞不出什麼名堂。壞了就砍掉重建。
-
-Security Group 只開 SSH，Proxy port 不對外。所有流量走 localhost。
-
-至於 Claude Max 的使用：`claude --print` 是官方 CLI 的官方功能，Request 從官方 Binary 出去。跟你坐在 Terminal 前面打字沒有區別。唯一注意：不要跑固定間隔的 heartbeat 任務，太規律的 request pattern 可能被標記。這類工作交給 Gemini Flash。
-
----
-
-## 最終成果
-
-一台 $15/月的 EC2 + $200/月的 Claude Max，換來：
-
-- ✅ Telegram 24/7 AI 助手（Opus 4.6 大腦）
-- ✅ 瀏覽器操作（Playwright + Chromium）
-- ✅ 寫程式（coding-agent）
-- ✅ 檔案讀寫
-- ✅ 排程任務（cron）
-- ✅ 持久記憶（MEMORY.md + session）
-- ✅ 可擴展（Twitter、Discord 隨時加）
-
-所有 Request 走官方 Binary，不偷 Token，不怕封號。
-
-既然有最好的靈魂，就該親手為它打造最適合的軀殼。
+| Model 不認識 | `Unknown model` | 用 `models.providers` 自訂，不能用內建 provider |
+| `OPENAI_BASE_URL` 沒用 | 請求打去真 OpenAI | OpenClaw 不讀環境變數，必須用 config |
+| Streaming 卡住 | Bot 沒回應 | `--print` 不支援真 streaming，用 simulated stream |
+| Docker 容器連不到 Proxy | Connection timeout | 改 `BIND_ADDR` 為 Docker bridge gateway IP + 加 iptables 規則 |
 
 ---
 
 ## 資源
 
-- Proxy 原始碼 + 部署筆記：在 `openclaw-claude-proxy/` 目錄
-- OpenClaw 官方：[github.com/openclaw/openclaw](https://github.com/openclaw/openclaw)
+- 上游 repo：[51AutoPilot/openclaw-claude-proxy](https://github.com/51AutoPilot/openclaw-claude-proxy)
+- OpenClaw：[github.com/openclaw/openclaw](https://github.com/openclaw/openclaw)
 - Claude Code CLI：[Anthropic 官方工具](https://docs.anthropic.com/en/docs/claude-code)
