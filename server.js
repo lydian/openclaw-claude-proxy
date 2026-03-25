@@ -200,6 +200,9 @@ function callClaude(prompt, { systemPrompt, claudeSessionId, isNewSession, hasTo
   return new Promise((resolve, reject) => {
     const args = ['--print'];
 
+    // Block Telegram MCP tools — OpenClaw delivers messages via its own Telegram plugin
+    args.push('--disallowedTools', 'mcp__plugin_telegram_telegram__reply,mcp__plugin_telegram_telegram__react,mcp__plugin_telegram_telegram__edit_message,mcp__plugin_telegram_telegram__download_attachment');
+
     // Permission mode: use allowedTools if we have approved tools, otherwise auto
     if (allowedTools && allowedTools.length > 0) {
       args.push('--allowedTools', allowedTools.join(','));
@@ -217,8 +220,8 @@ function callClaude(prompt, { systemPrompt, claudeSessionId, isNewSession, hasTo
     // Tool support
     if (hasTools) {
       args.push('--max-turns', String(MAX_TOOL_TURNS));
-      args.push('--output-format', 'json');
     }
+    args.push('--verbose', '--output-format', 'stream-json');
 
     // System prompt (only on new sessions)
     const SYS_PROMPT_ARG_LIMIT = 100_000;
@@ -260,14 +263,22 @@ function callClaude(prompt, { systemPrompt, claudeSessionId, isNewSession, hasTo
       if (code !== 0) {
         reject(new Error(`Claude CLI exited with code ${code}: ${stderr.slice(0, 500)}`));
       } else {
-        let result = stdout.trim();
-        if (hasTools && result) {
+        // Parse stream-json: extract last assistant text from NDJSON lines
+        let lastAssistantText = '';
+        const lines = stdout.trim().split('\n');
+        for (const line of lines) {
           try {
-            const json = JSON.parse(result);
-            result = (json.result || result).trim();
+            const obj = JSON.parse(line);
+            if (obj.type === 'assistant' && obj.message && obj.message.content) {
+              const texts = obj.message.content
+                .filter(b => b.type === 'text')
+                .map(b => b.text)
+                .join('\n');
+              if (texts.trim()) lastAssistantText = texts.trim();
+            }
           } catch (_) {}
         }
-        resolve(result);
+        resolve(lastAssistantText || '(No text response produced)');
       }
     });
 
